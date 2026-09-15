@@ -34,24 +34,33 @@ claimReward() 函数质押用户本人调用领取奖励 <br>
 6. 罚没计算：contractWethBalance：合约当前实际持有的 WETH 余额（链上真实余额）；totalAssets：账面总资产（和份额体系强绑定，常态下 totalAssets = contractWethBalance），区块被以太坊罚没时，亏损 WETH 划转至运营账户，计算资产亏损比例，更新用户份额<br>
 7. 用户解质押时自动结算未领奖励（防重入，避免重复领取本金和奖励）<br>
 8. 更新账面总资产<br>
+9. 如果当前无用户质押，产生奖励（bufferReward），当totalShares > 0时，totalAssets = bufferReward + 存入的资产<br>
 
 ### 质押奖励规则
 1. 计息基准规则:按区块计息，交易上链当前区块即刻生效，新质押/追加质押：当前区块开始累计奖励，部分/全部解质押：赎回区块停止新增奖励，已累计奖励保留<br>
 2. 公式：单用户可领取奖励 = 用户质押份额 × 对应区间累计总奖励/全网总份额<br>
 3. 奖励来源：传入税前总收益，合约在链上自动扣除 10% 固定比例手续费；扣除的手续费划转至手续费接收地址，剩余金额进入质押奖励池。<br>
-4. 奖励注入方式：调用 depositReward(uint256 amount)，传入税前总收益，合约自动完成手续费拆分，将税后部分注入奖励池。；注入即时生效，从当前区块开始参与全网分红。如果当前无用户质押，本次注入奖励暂存合约奖励池，不参与分红、不计入待分发收益后续有用户新增质押（totalShares > 0）时，从当前区块开始，存量和新增质押一起参与分红<br>
+4. 奖励注入方式：调用 depositReward(uint256 amount)，传入税前总收益，合约自动完成手续费拆分，将税后部分注入奖励池。注入即时生效，从当前区块开始参与全网分红。如果当前无用户质押，本次注入奖励(bufferReward)暂存合约奖励池，暂存期间不参与分红、不计入待分发收益、不计入质押池`totalAssets`；管理员不可提取暂存缓冲区资金。当发生第一笔用户质押，totalShares > 0时，缓冲区全部暂存奖励一次性转入正式奖励池，从该质押对应的区块开始参与全网分红。<br>
 5. 奖励结算时点：1、用户解质押时计算奖励并结算；2、单独结算奖励部分：用户可随时主动调用 claimReward() 提取累计待领奖励，操作不减少自身质押份额，质押状态保持不变；领取后自动完成记账点位对齐，已发放奖励不会重复计算；无待领奖励时调用函数，不会产生转账，仅静默返回；该接口与解质押结算相互独立<br>
 6. 查询奖励：快照模式，查询奖励时实时计算，不实时修改用户数据<br>
 
 
 ### 罚没规则
 1. 仅管理员触发，全网质押份额同比例缩水<br>
-2. 缩水资产计算总资产（totalAssets），亏损后总资产（newTotalAssets），亏损金额（lossAmount），旧份额（totalShares）<br>
-   亏损比例：lossratio=（totalAssets-lossAmount）/totalAssets <br>
-   亏损后份额计算：newTotalShares=totalShares * lossratio<br>
+2. 缩水资产计算总资产（totalAssets），亏损后总资产（newTotalAssets），亏损金额（lossAmount），旧份额（totalShares），<br>
+   uint256 public constant SCALE = 1e36;
+   亏损比例：lossratioScaled= = Math.mulDiv( totalAssets - lossAmount, SCALE, totalAssets ); <br>
+   亏损后份额计算：newTotalShares = Math.mulDiv( totalShares, lossRatioScaled, SCALE );<br>
 3. 人工每15天检查节点份额并留存记录，当出现亏损，进行上报并进行罚没，亏损金额必须 ≤ 当前质押池总质押量，禁止超量上报<br>
 4. Slashing 执行前，需统一结算全网点位，所有用户已产生的奖励全部固化<br>
 5. Slashing 执行后，更新全局质押份额，记录罚没数据<br>
+6.用户存储记录`userShares`为原始份额。<br>
+7. Slashing 触发前：固化奖励快照，更新全局奖励累计参数，冻结本次罚没区间内的奖励，不循环遍历用户结算奖励。<br>
+8. 触发slash，计算新的slashFactor, slashFactor_new = slashFactor_old * (newTotalAssets) / totalAssetsBeforeSlash。用户操作时实时有效份额 = userShares × slashFactor / WAD <br>
+9. 计算罚没后的新`slashFactor`，仅更新全局`slashFactor`、全局总资产`totalAssets`；不修改任意用户的 userShares。<br>
+10. 用户在后续 deposit/withdraw/claimReward 操作时，自动基于当前 slashFactor 懒计算有效份额与可提取奖励。<br>
+11. 所有读取用户有效份额、计算奖励的地方，都必须带上`slashFactor`做 mulDiv 计算。<br>
+12. 多次罚没场景：slashFactor为累积乘法，仅记录最新全局值；本金有效份额随多次罚没连续衰减。每次罚没触发前会固化截至该时点已产生奖励，已固化奖励不受后续任何罚没缩水影响。
 
 ### 安全架构
 1. 防重入：全局引入 ReentrancyGuard，所有资金交互函数统一加锁<br>
@@ -59,7 +68,7 @@ claimReward() 函数质押用户本人调用领取奖励 <br>
 3. 紧急暂停：全局开关，故障 / 攻击时暂停核心业务，Pausable及UnPauseable 紧急暂停/启动开关<br>
 4. 基础入参校验：零地址、零金额、越界数值 全场景拦截<br>
 5. 资金转移容错：统一使用 SafeERC20，兜底 ERC20 转账失败<br>
-6. 管理员风控：1、调用频率对管理员接口增加 RateLimit 调用频率限制：设置单位时间最大调用次数，防止短时间连续批量高危操作；2、配置 单次操作金额上限阈值，管理员单次资金类操作不可超过阈值；3、大额操作必须通过多签确认；4、所有涉及资金、配置变更的管理员接口必须经过时间锁调度，禁止管理员即时执行高危动作；5、资产回滚 / 紧急救助逻辑做权限隔离：普通管理员无直接回滚用户资产权限；仅多签 + 时间锁双重条件同时满足，才可触发资产救助回滚，禁止单管理员一键回滚用户资产；6、claimReward() 函数质押用户本人调用领取奖励，禁止代领奖励；7、管理员高危操作启用 Timelock 时间锁，设置固定等待窗口期；所有涉及资金、配置变更的管理员接口必须经过时间锁调度，禁止管理员即时执行高危动作；<br>
+6. 管理员风控：1、调用频率对管理员接口增加 RateLimit 调用频率限制：设置单位时间最大调用次数，防止短时间连续批量高危操作；2、配置单次操作金额上限阈值，管理员单次资金类操作不可超过阈值；3、部署时，将 owner 设置为 Gnosis Safe 多签钱包地址，大额操作必须通过多签确认（合约仅定义单一 owner 角色，owner 地址部署为 Gnosis Safe 多签钱包（如 2/3），多签校验在钱包层实现，合约内部不内置多签逻辑。）；4、所有涉及资金、配置变更的管理员接口默认经过时间锁调度，禁止管理员即时执行高危动作；例外豁免清单：pause ()、unpause ()、depositReward ()、slash () 。豁免接口不经过时间锁，但仍强制配套额度上限、调用频率限制、全量链上事件监控；5、claimReward() 函数质押用户本人调用领取奖励，禁止代领奖励；<br>
 7. 状态变更规范：严格遵循 Checks-Effects-Interactions(CEI) 模式<br>
 
 ### 测试
@@ -95,9 +104,14 @@ claimReward() 函数质押用户本人调用领取奖励 <br>
 24. 异常测试：操作：gas不足无法操作；预期：交易失败，回滚<br>
 25. 安全测试5：操作：管理员短时间内超过 rate‑limit 最大调用次数，预期：revert操作<br>
 26. 安全测试6：操作：管理员单次资金操作超过金额上限，预期：revert操作<br>
-27. 安全测试7：操作：单管理员账号尝试直接调用资产回滚接口，预期： revert<br>
-28. 安全测试8：操作：单管理员账号尝试直接调用资产回滚接口，预期：revert<br>
-29. 安全测试9：操作：管理员高危操作不通过 timelock 直接调用，预期： revert<br>
+27. 安全测试7：操作：管理员高危操作不通过 timelock 直接调用，预期： revert<br>
+28. 安全测试8：操作：管理员调用pause ()、unpause ()、depositReward ()、slash ()，预期 不触发timelock()<br>
+29. 空池注入测试 1：操作：totalShares=0 时调用 depositReward；预期：奖励进入 bufferReward，不进入 rewardPool，不参与分红，totalAssets 不变
+30. 空池注入测试 2：操作：空池多次调用 depositReward；预期：bufferReward 累计累加，rewardPool 仍为 0
+31. 缓冲区迁移测试：操作：空池注入奖励后，首个用户执行质押；预期：bufferReward 全部转入资产池，bufferReward 清零，触发 BufferRewardMigrated 事件，迁移后奖励从当前区块参与分红
+32. 缓冲区不可提取测试：操作：管理员尝试调用任何接口提取 bufferReward；预期：不存在该接口，无法提取
+33. 缓冲区不参与罚没测试：操作：空池注入奖励后执行 slashing；预期：罚没仅影响 totalAssets，bufferReward 金额不变
+34. 缓冲区不计入总资产测试：操作：空池注入奖励后查询 totalAssets；预期：totalAssets 仅含质押本金，不含 bufferReward
 
 ### 验收标准
 1. 以上测试全部通过<br>
