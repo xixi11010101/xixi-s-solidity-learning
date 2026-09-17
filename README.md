@@ -22,7 +22,7 @@ Sepolia测试网 WETH：以实际部署地址为准，合约内由构造函数�
 精度误差：统一使用 1e36 放大系数，整除运算无浮点误差、无累积舍入<br>
 Slashing：资产缩水不影响历史已累计奖励，仅影响后续分红权重 <br>
 claimReward() 函数质押用户本人调用领取奖励 <br>
-用户实际资产 = 个人份额 ÷ 全局总份额 × 池子总资产 <br>
+用户实际资产 = Math.mulDiv (userShares, slashFactor, SCALE) ÷ totalShares × totalAssets <br>
 凭证是内部记账变量<br>
 
 ### 业务流程
@@ -31,36 +31,38 @@ claimReward() 函数质押用户本人调用领取奖励 <br>
 3. 用户可随时领取奖励<br>
 4. 按总收益抽取手续费<br>
 5. 用户可随时解质押取回本金<br>
-6. 罚没计算：contractWethBalance：合约当前实际持有的 WETH 余额（链上真实余额）；totalAssets：账面总资产（和份额体系强绑定，常态下 totalAssets = contractWethBalance），区块被以太坊罚没时，亏损 WETH 划转至运营账户，计算资产亏损比例，更新用户份额<br>
+6. 罚没计算：contractWethBalance：合约当前实际持有的 WETH 余额（链上真实余额）；totalAssets：账面总资产（和份额体系强绑定，常态下 totalAssets = contractWethBalance），发现区块出现罚没时，亏损 WETH 划转至运营账户，计算资产亏损比例，更新全局 slashFactor 衰减因子<br>
 7. 用户解质押时自动结算未领奖励（防重入，避免重复领取本金和奖励）<br>
 8. 更新账面总资产<br>
 9. 如果当前无用户质押，产生奖励（bufferReward），当totalShares > 0时，totalAssets = bufferReward + 存入的资产<br>
 
 ### 质押奖励规则
 1. 计息基准规则:按区块计息，交易上链当前区块即刻生效，新质押/追加质押：当前区块开始累计奖励，部分/全部解质押：赎回区块停止新增奖励，已累计奖励保留<br>
-2. 公式：单用户可领取奖励 = 用户质押份额 × 对应区间累计总奖励/全网总份额<br>
+2. 公式：单用户可领取奖励 = 用户有效质押份额 × 对应区间累计总奖励/全网总份额 <br>  有效质押份额 = Math.mulDiv (userShares, slashFactor, SCALE) <br>  
 3. 奖励来源：传入税前总收益，合约在链上自动扣除 10% 固定比例手续费；扣除的手续费划转至手续费接收地址，剩余金额进入质押奖励池。<br>
 4. 奖励注入方式：调用 depositReward(uint256 amount)，传入税前总收益，合约自动完成手续费拆分，将税后部分注入奖励池。注入即时生效，从当前区块开始参与全网分红。如果当前无用户质押，本次注入奖励(bufferReward)暂存合约奖励池，暂存期间不参与分红、不计入待分发收益、不计入质押池`totalAssets`；管理员不可提取暂存缓冲区资金。当发生第一笔用户质押，totalShares > 0时，缓冲区全部暂存奖励一次性转入正式奖励池，从该质押对应的区块开始参与全网分红。<br>
 5. 奖励结算时点：1、用户解质押时计算奖励并结算；2、单独结算奖励部分：用户可随时主动调用 claimReward() 提取累计待领奖励，操作不减少自身质押份额，质押状态保持不变；领取后自动完成记账点位对齐，已发放奖励不会重复计算；无待领奖励时调用函数，不会产生转账，仅静默返回；该接口与解质押结算相互独立<br>
 6. 查询奖励：快照模式，查询奖励时实时计算，不实时修改用户数据<br>
+7. 已固化的历史奖励，按罚没前旧 slashFactor 快照计算，不受后续 slashFactor 变化影响 <br>  
 
 
 ### 罚没规则
-1. 仅管理员触发，全网质押份额同比例缩水<br>
-2. 缩水资产计算总资产（totalAssets），亏损后总资产（newTotalAssets），亏损金额（lossAmount），旧份额（totalShares），<br>
-   uint256 public constant SCALE = 1e36;
-   亏损比例：lossratioScaled= = Math.mulDiv( totalAssets - lossAmount, SCALE, totalAssets ); <br>
-   亏损后份额计算：newTotalShares = Math.mulDiv( totalShares, lossRatioScaled, SCALE );<br>
+1. 仅管理员触发，通过全局衰减因子实现用户有效份额同比例缩水<br>
+2. 缩水资产计算：
+- `totalAssets`：账面总资产（用户质押本金）
+- `lossAmount`：亏损金额（必须 ≤ totalAssets）
+- `SCALE = 1e36`（精度放大系数）
+- 用户存储记录`userShares`为原始份额。
+- 用户有效份额计算：`effectiveShares = Math.mulDiv(userShares, slashFactor, SCALE)`<br>
 3. 人工每15天检查节点份额并留存记录，当出现亏损，进行上报并进行罚没，亏损金额必须 ≤ 当前质押池总质押量，禁止超量上报<br>
 4. Slashing 执行前，需统一结算全网点位，所有用户已产生的奖励全部固化<br>
-5. Slashing 执行后，更新全局质押份额，记录罚没数据<br>
-6.用户存储记录`userShares`为原始份额。<br>
-7. Slashing 触发前：固化奖励快照，更新全局奖励累计参数，冻结本次罚没区间内的奖励，不循环遍历用户结算奖励。<br>
-8. 触发slash，计算新的slashFactor, slashFactor_new = slashFactor_old * (newTotalAssets) / totalAssetsBeforeSlash。用户操作时实时有效份额 = userShares × slashFactor / WAD <br>
-9. 计算罚没后的新`slashFactor`，仅更新全局`slashFactor`、全局总资产`totalAssets`；不修改任意用户的 userShares。<br>
-10. 用户在后续 deposit/withdraw/claimReward 操作时，自动基于当前 slashFactor 懒计算有效份额与可提取奖励。<br>
-11. 所有读取用户有效份额、计算奖励的地方，都必须带上`slashFactor`做 mulDiv 计算。<br>
-12. 多次罚没场景：slashFactor为累积乘法，仅记录最新全局值；本金有效份额随多次罚没连续衰减。每次罚没触发前会固化截至该时点已产生奖励，已固化奖励不受后续任何罚没缩水影响。
+5. Slashing 执行后，记录罚没数据<br>
+6. Slashing 触发前：固化奖励快照，更新全局奖励累计参数，冻结本次罚没区间内的奖励，不循环遍历用户结算奖励。<br>
+7. 触发slash，计算新的slashFactor, slashFactor_new = slashFactor_old * (newTotalAssets) / totalAssetsBeforeSlash。用户操作时实时有效份额 = userShares × slashFactor / SCALE <br>
+8. 计算罚没后的新`slashFactor`，仅更新全局`slashFactor`、全局总资产`totalAssets`；不修改任意用户的 userShares。<br>
+9. 用户在后续 deposit/withdraw/claimReward 操作时，自动基于当前 slashFactor 懒计算有效份额与可提取奖励。<br>
+10. 所有读取用户有效份额、计算奖励的地方，都必须带上`slashFactor`做 mulDiv 计算。<br>
+11. 多次罚没场景：slashFactor为累积乘法，仅记录最新全局值；本金有效份额随多次罚没连续衰减。每次罚没触发前会固化截至该时点已产生奖励，已固化奖励不受后续任何罚没缩水影响。
 
 ### 安全架构
 1. 防重入：全局引入 ReentrancyGuard，所有资金交互函数统一加锁<br>
@@ -87,13 +89,13 @@ claimReward() 函数质押用户本人调用领取奖励 <br>
 7. 边界测试3：操作：质押：预期：质押池总量不超5000，若超过，质押失败<br>
 8. 边界测试4：操作：解质押；预期：解质押金额小于等于质押金额，若超过，解质押失败<br>
 9. 管理员测试1：操作：记录快照并更新收益；预期：有收益，调用depositReward，并记录；无收益，记录全局状态；亏损：进行罚没操作，并记录<br>
-10. 管理员测试2：操作：进行罚没；预期：执行前全局奖励点位全部结算固化；所有用户质押份额同比例缩水；历史待领奖励完全不变；后续奖励按新份额重新分配<br>
+10. 管理员测试2：操作：进行罚没；预期：执行前全局奖励点位全部结算固化；用户原始份额不变，有效份额通过 slashFactor 正确衰减；历史待领奖励完全不变；后续奖励按新有效份额重新分；<br>
 11. 管理员测试3：操作：用户操作；预期：用户无法操作管理员函数<br>
 12. 奖励测试1：操作：用户解质押；预期：不同质押额的用户有按比例获得奖励<br>
 13. 奖励测试2：操作：领取奖励；预期：没有重复领取奖励<br>
 14. 奖励测试3：操作：奖励来源计算；预期：管理员调用 depositReward，传入税前总收益，合约自动完成手续费拆分，将税后收益转入合约奖励池池<br>
 15. 精度测试：操作：基于1e36进行质押、解质押操作，没有精度漂移造成的亏损或质押池资产损失<br>
-16. 罚没测试1：操作：罚没；预期：罚没不为0<br>
+16. 罚没测试1：操作：传入合法大于 0 的亏损金额执行罚没；预期：slashFactor 正确更新，totalAssets 扣减，用户原始 userShares 不变<br>
 17. 罚没测试2：操作：罚没；预期：罚没金额小于等于质押池总量<br>
 18. 罚没测试3：操作：罚没；预期：质押池总额大于0，有可罚没资产<br>
 19. 安全测试1：操作：用户操作函数；预期：防重入函数生效，嵌套调用全部拦截<br>
