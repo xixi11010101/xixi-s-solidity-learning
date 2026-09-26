@@ -34,7 +34,7 @@ claimReward() 函数质押用户本人调用领取奖励 <br>
 6. 罚没计算：contractWethBalance：合约当前实际持有的 WETH 余额（链上真实余额）；totalAssets：账面总资产（和份额体系强绑定，常态下 totalAssets = contractWethBalance），发现区块出现罚没时，亏损 WETH 划转至运营账户，计算资产亏损比例，更新全局 slashFactor 衰减因子<br>
 7. 用户解质押时自动结算未领奖励（防重入，避免重复领取本金和奖励）<br>
 8. 更新账面总资产<br>
-9. 如果当前无用户质押，产生奖励（bufferReward），当totalShares > 0时，totalAssets = bufferReward + 存入的资产<br>
+9. 如果当前无用户质押，调用 depositReward 产生的奖励存入 bufferReward 缓冲区；bufferReward 暂存期间不计入 totalAssets、不参与分红。当发生第一笔用户质押，totalShares > 0 时，缓冲区全部暂存奖励一次性转入正式奖励池，bufferReward 清零并触发 BufferRewardMigrated 事件；转入的奖励进入奖励池用于分红，不并入 totalAssets（totalAssets 仅统计用户质押本金）。<br>
 
 ### 质押奖励规则
 1. 计息基准规则:按区块计息，交易上链当前区块即刻生效，新质押/追加质押：当前区块开始累计奖励，部分/全部解质押：赎回区块停止新增奖励，已累计奖励保留<br>
@@ -53,9 +53,13 @@ claimReward() 函数质押用户本人调用领取奖励 <br>
 - `lossAmount`：亏损金额（必须 ≤ totalAssets）
 - `SCALE = 1e36`（精度放大系数）
 - 用户存储记录`userShares`为原始份额。
-- 用户有效份额计算：`effectiveShares = Math.mulDiv(userShares, slashFactor, SCALE)`<br>
+- 用户计算：`effectiveShares = Math.mulDiv(userShares, slashFactor, SCALE)`<br>
 3. 人工每15天检查节点份额并留存记录，当出现亏损，进行上报并进行罚没，亏损金额必须 ≤ 当前质押池总质押量，禁止超量上报<br>
-4. Slashing 执行前，需统一结算全网点位，所有用户已产生的奖励全部固化<br>
+4. Slashing 执行前，需统一结算全网点位，所有用户已产生的奖励全部固化。rewardIndex：全局奖励累计点位（放大 1e36 精度）;slashCheckpoint[]：数组存储每一次 slash 快照：(snapshotRewardIndex, snapshotSlashFactor, timestamp)，每一条快照 = 罚没发生那一刻的(全局奖励点位 + 当前 slashFactor)<br>
+4.1 先读取当前全局rewardIndex，写入一条新 slashCheckpoint, 固化所有用户截至当前区块的奖励<br>
+4.2 更新slashFactor、更新totalAssets<br>
+4.3 触发 Slash 事件，写入快照索引、旧/新 slashFactor、亏损金额、区块号<br>
+4.4 Slashing 执行前固化奖励，采用全局奖励检查点快照机制，不遍历用户存储。在 slash 触发时记录全局 rewardIndex 与当前 slashFactor 作为快照。用户后续操作时，基于快照区间分段计算奖励；快照区间内的奖励使用快照对应的 slashFactor，不受后续 slashFactor 变更<br>
 5. Slashing 执行后，记录罚没数据<br>
 6. Slashing 触发前：固化奖励快照，更新全局奖励累计参数，冻结本次罚没区间内的奖励，不循环遍历用户结算奖励。<br>
 7. 触发slash，计算新的slashFactor, slashFactor_new = slashFactor_old * (newTotalAssets) / totalAssetsBeforeSlash。用户操作时实时有效份额 = userShares × slashFactor / SCALE <br>
@@ -67,11 +71,32 @@ claimReward() 函数质押用户本人调用领取奖励 <br>
 ### 安全架构
 1. 防重入：全局引入 ReentrancyGuard，所有资金交互函数统一加锁<br>
 2. 访问控制：基于 Ownable + 函数级 onlyOwner，区分普通用户 / 管理员<br>
-3. 紧急暂停：全局开关，故障 / 攻击时暂停核心业务，Pausable及UnPauseable 紧急暂停/启动开关<br>
+3. 紧急暂停：全局开关，故障 / 攻击时暂停核心业务；紧急暂停/启动开关：基于 Pausable 提供 pause()/unpause() <br>
 4. 基础入参校验：零地址、零金额、越界数值 全场景拦截<br>
 5. 资金转移容错：统一使用 SafeERC20，兜底 ERC20 转账失败<br>
-6. 管理员风控：1、调用频率对管理员接口增加 RateLimit 调用频率限制：设置单位时间最大调用次数，防止短时间连续批量高危操作；2、配置单次操作金额上限阈值，管理员单次资金类操作不可超过阈值；3、部署时，将 owner 设置为 Gnosis Safe 多签钱包地址，大额操作必须通过多签确认（合约仅定义单一 owner 角色，owner 地址部署为 Gnosis Safe 多签钱包（如 2/3），多签校验在钱包层实现，合约内部不内置多签逻辑。）；4、所有涉及资金、配置变更的管理员接口默认经过时间锁调度，禁止管理员即时执行高危动作；例外豁免清单：pause ()、unpause ()、depositReward ()、slash () 。豁免接口不经过时间锁，但仍强制配套额度上限、调用频率限制、全量链上事件监控；5、claimReward() 函数质押用户本人调用领取奖励，禁止代领奖励；<br>
+6. 管理员风控：1、调用频率对管理员接口增加 RateLimit 调用频率限制：设置单位时间最大调用次数，防止短时间连续批量高危操作；2、配置单次操作金额上限阈值，管理员单次资金类操作不可超过阈值；3、部署时，将 owner 设置为 Gnosis Safe 多签钱包地址，大额操作必须通过多签确认（合约仅定义单一 owner 角色，owner 地址部署为 Gnosis Safe 多签钱包（如 2/3），多签校验在钱包层实现，合约内部不内置多签逻辑。）；4、所有涉及资金、配置变更的管理员接口默认经过时间锁（7天）调度，禁止管理员即时执行高危动作；例外豁免清单：pause ()、unpause ()、depositReward ()。豁免接口不经过时间锁，以下还需要时间锁控制：transferOwnership()：转移合约 owner 权限；setFeeRecipient()：修改手续费接收地址 feeRecipient；setDepositLimit()：修改质押参数（单地址质押上限、池子总上限、最小质押金额）；setRewardFeeRate()：修改奖励手续费比例 等等<br>
+5、claimReward() 函数质押用户本人调用领取奖励，禁止代领奖励；<br>
 7. 状态变更规范：严格遵循 Checks-Effects-Interactions(CEI) 模式<br>
+
+### 份额铸造
+1. 用户质押输入 WETH 本金 amount，合约计算存入原始记账份额：userShares = Math.mulDiv(amount, SCALE, slashFactor)<br>
+2. 原始记账份额`userShares`永久存储在用户记录，不会随 slash 修改<br>
+3. 有效参与分红份额：effectiveShares = Math.mulDiv(userShares, slashFactor, SCALE)<br>
+4. 当 slashFactor = SCALE（从未罚没），userShares = amount，和常规 1:1 份额行为保持一致<br>
+5. 新用户质押时，历史罚没仅影响存量质押用户，新质押本金不受历史 slashFactor 衰减<br>
+
+### 全局风控参数表
+| 参数名称 | 符号 | 推荐值 | 业务含义 | 谁能修改 | 修改流程 |
+|---|---|---|---|---|---|
+| Timelock等待窗口期 | TIMELOCK_DELAY | 43200 区块（约7天，以太坊主网1区块≈12s） | 所有需要时间锁的提案，提交后必须等待该区块数才能执行；豁免接口不受该延迟约束 | Owner（Gnosis多签） | 时间锁调度，不可即时改 |
+| 管理员接口频率限制窗口 | RATE_LIMIT_WINDOW | 86400 区块（约1天） | RateLimit统计周期，仅作用于非豁免管理员接口 | Owner（Gnosis多签） | 时间锁调度 |
+| 管理员窗口内最大调用次数 | RATE_LIMIT_MAX_CALLS | 3次 / 窗口 | 管理员高危接口（slash/setFeeRecipient等）在窗口内最多执行3次；超过直接revert | Owner（Gnosis多签） | 时间锁调度 |
+| Slash单次最大扣减比例 | SLASH_MAX_RATIO | 10%（SCALE=1e36） | 单次slash最多只能罚没当前totalAssets的10%；单次亏损不能超过该比例，防止一次性掏空池子 | Owner（Gnosis多签） | 时间锁调度 |
+| 管理员单次资金操作金额上限 | ADMIN_SINGLE_MAX_AMOUNT | 500 WETH（wei） | 管理员资金类操作（slash）单次操作金额上限；超过直接revert | Owner（Gnosis多签） | 时间锁调度 |
+| 奖励手续费比例 | REWARD_FEE_RATE | 10%（SCALE=1e36） | depositReward自动扣取手续费比例 | Owner（Gnosis多签） | 时间锁调度 |
+| 单地址质押上限 | DEPOSIT_PER_USER_MAX | 50 WETH | 单个用户最大质押额度 | Owner（Gnosis多签） | 时间锁调度 |
+| 池子全局质押上限 | DEPOSIT_POOL_MAX | 5000 WETH | 质押池本金总上限 | Owner（Gnosis多签） | 时间锁调度 |
+| 最小质押金额 | DEPOSIT_MIN | 1 WETH | 单笔质押最低门槛 | Owner（Gnosis多签） | 时间锁调度 |
 
 ### 测试
 1. 测试范围：功能测试、边界测试、异常测试、安全测试、奖励计算测试、Slashing 罚没测试、集成流程测试<br>
@@ -93,7 +118,7 @@ claimReward() 函数质押用户本人调用领取奖励 <br>
 11. 管理员测试3：操作：用户操作；预期：用户无法操作管理员函数<br>
 12. 奖励测试1：操作：用户解质押；预期：不同质押额的用户有按比例获得奖励<br>
 13. 奖励测试2：操作：领取奖励；预期：没有重复领取奖励<br>
-14. 奖励测试3：操作：奖励来源计算；预期：管理员调用 depositReward，传入税前总收益，合约自动完成手续费拆分，将税后收益转入合约奖励池池<br>
+14. 奖励测试3：操作：奖励来源计算；预期：管理员调用 depositReward，传入税前总收益，合约自动完成手续费拆分，将税后收益转入合约奖励池<br>
 15. 精度测试：操作：基于1e36进行质押、解质押操作，没有精度漂移造成的亏损或质押池资产损失<br>
 16. 罚没测试1：操作：传入合法大于 0 的亏损金额执行罚没；预期：slashFactor 正确更新，totalAssets 扣减，用户原始 userShares 不变<br>
 17. 罚没测试2：操作：罚没；预期：罚没金额小于等于质押池总量<br>
@@ -104,16 +129,23 @@ claimReward() 函数质押用户本人调用领取奖励 <br>
 22. 安全测试4；操作：转账；预期：余额不足，进行revert, 无静默<br>
 23. 事件测试：操作：进行函数操作；预期：相关事件触发并完整记录信息<br>
 24. 异常测试：操作：gas不足无法操作；预期：交易失败，回滚<br>
-25. 安全测试5：操作：管理员短时间内超过 rate‑limit 最大调用次数，预期：revert操作<br>
-26. 安全测试6：操作：管理员单次资金操作超过金额上限，预期：revert操作<br>
-27. 安全测试7：操作：管理员高危操作不通过 timelock 直接调用，预期： revert<br>
-28. 安全测试8：操作：管理员调用pause ()、unpause ()、depositReward ()、slash ()，预期 不触发timelock()<br>
-29. 空池注入测试 1：操作：totalShares=0 时调用 depositReward；预期：奖励进入 bufferReward，不进入 rewardPool，不参与分红，totalAssets 不变
-30. 空池注入测试 2：操作：空池多次调用 depositReward；预期：bufferReward 累计累加，rewardPool 仍为 0
-31. 缓冲区迁移测试：操作：空池注入奖励后，首个用户执行质押；预期：bufferReward 全部转入资产池，bufferReward 清零，触发 BufferRewardMigrated 事件，迁移后奖励从当前区块参与分红
-32. 缓冲区不可提取测试：操作：管理员尝试调用任何接口提取 bufferReward；预期：不存在该接口，无法提取
-33. 缓冲区不参与罚没测试：操作：空池注入奖励后执行 slashing；预期：罚没仅影响 totalAssets，bufferReward 金额不变
-34. 缓冲区不计入总资产测试：操作：空池注入奖励后查询 totalAssets；预期：totalAssets 仅含质押本金，不含 bufferReward
+25. 安全测试5：操作：1 天窗口内连续调用管理员受限接口（slash/setFeeRecipient 等），调用≥4 次；，预期：第4次操作被revert<br>
+26. 安全测试6：操作：调用 slash，传入亏损金额 > 500 WETH，预期：revert操作<br>
+27. 安全测试7：操作：直接调用transferOwnership () /setFeeRecipient () /setDepositLimit () /setRewardFeeRate () /setRiskParams ()，预期： 不允许直接调用，交易 revert，必须提交提案走时间锁调度，等待窗口期结束后方可执行<br>
+28. 安全测试8：操作：管理员调用pause ()、unpause ()、depositReward ()，预期 不触发timelock()<br>
+29. 空池注入测试 1：操作：totalShares=0 时调用 depositReward；预期：奖励进入 bufferReward，不进入 rewardPool，不参与分红，totalAssets 不变<br>
+30. 空池注入测试 2：操作：空池多次调用 depositReward；预期：bufferReward 累计累加，rewardPool 仍为 0<br>
+31. 缓冲区迁移测试：操作：空池注入奖励后，首个用户执行质押；预期：bufferReward 全部转入奖励池，bufferReward 清零，触发 BufferRewardMigrated 事件，迁移后奖励从当前区块参与分红<br>
+32. 缓冲区不可提取测试：操作：管理员尝试调用任何接口提取 bufferReward；预期：不存在该接口，无法提取<br>
+33. 缓冲区不计入总资产测试：操作：空池注入奖励后查询 totalAssets；预期：totalAssets 仅含质押本金，不含 bufferReward<br>
+34. 份额铸造测试1：操作：每次 deposit（质押）都强制使用这个铸造公式；预期：有使用这个公式<br>
+35. 份额铸造测试2：操作：已有 slash 罚没后，新用户质押，验证有效份额等于存入本金，不会被历史罚没缩水；预期：新质押份额不被历史罚没影响<br>
+36. 罚没测试4：操作：存在 slash 快照；用户 claimReward；预期：奖励分段计算，快照前区间使用快照 slashFactor，快照后区间使用最新 slashFactor；无需遍历所有用户<br>
+37. 安全测试9：操作：管理员提交 setFeeRecipient /setDepositLimit 提案到时间锁；预期：提案进入等待窗口期（7天）；窗口期未到执行则 revert；窗口期结束后可执行，状态变更触发事件<br>
+38. 安全测试10：操作：管理员尝试直接调用 setRiskParams 调高单次金额上限，不经过时间锁，随后立刻执行 slash；预期：参数修改调用直接 revert；参数修改必须提交时间锁提案，等待 7 天窗口；窗口期内参数维持原值，无法即时调高限额来绕过 slash 金额限制<br>
+39. 安全测试12：操作：Gnosis 多签钱包提交合法 slash 罚没提案至时间锁；预期：提案进入等待窗口期（7 天）；窗口期未到执行则 revert；窗口期结束后可正常执行罚没逻辑、更新 slashFactor 与 totalAssets，触发对应事件<br>
+40. 安全测试13：操作：普通外部账户（非 Gnosis 多签 owner）尝试向时间锁提交 slash 提案；预期：提案提交校验失败，直接 revert，无法创建时间锁提案<br>
+41. 安全测试14：操作：Gnosis 多签钱包提交 slash 提案，提案内亏损金额超过 SLASH_MAX_RATIO 上限；预期：窗口期到期执行时交易 revert，不执行罚没、状态无变更<br>
 
 ### 验收标准
 1. 以上测试全部通过<br>
